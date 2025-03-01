@@ -13,6 +13,12 @@ export class EnhancedPerformanceTracker extends PerformanceTracker {
   private renderTimeHistory: number[] = [];
   private particlesPerSecondHistory: number[] = [];
   
+  // Long-term tracking
+  private longTermFpsCount: number = 0;
+  private longTermSimTimeSum: number = 0;
+  private longTermRenderTimeSum: number = 0;
+  private sessionStartTime: number = performance.now();
+  
   // Maximum history length to keep
   private readonly MAX_HISTORY_LENGTH = 60; // Keep last minute of stats (at 3s intervals)
   
@@ -26,6 +32,7 @@ export class EnhancedPerformanceTracker extends PerformanceTracker {
     
     this.statsElement = document.getElementById('performance-stats')!;
     this.lastUpdateTime = performance.now();
+    this.sessionStartTime = performance.now();
     
     // Make the stats container draggable
     this.makeDraggable(this.statsElement);
@@ -38,20 +45,21 @@ export class EnhancedPerformanceTracker extends PerformanceTracker {
     container.style.position = 'absolute';
     container.style.top = '10px';
     container.style.right = '10px';
-    container.style.backgroundColor = 'rgba(0, 0, 0, 0.7)';
+    container.style.backgroundColor = 'rgba(35, 35, 35, 0.9)';
     container.style.color = 'white';
     container.style.padding = '10px';
     container.style.borderRadius = '5px';
     container.style.fontFamily = 'monospace';
     container.style.fontSize = '14px';
     container.style.zIndex = '1000';
-    container.style.width = '300px';
+    container.style.width = '360px';
     container.style.cursor = 'move'; // Show move cursor
     container.style.userSelect = 'none'; // Prevent text selection during drag
     container.style.boxShadow = '0 4px 8px rgba(0,0,0,0.3)';
     
     // Add a header with title and minimize button
     const headerDiv = document.createElement('div');
+    headerDiv.id = 'performance-stats-header';
     headerDiv.style.display = 'flex';
     headerDiv.style.justifyContent = 'space-between';
     headerDiv.style.alignItems = 'center';
@@ -64,6 +72,42 @@ export class EnhancedPerformanceTracker extends PerformanceTracker {
     titleSpan.style.fontWeight = 'bold';
     titleSpan.style.fontSize = '16px';
     headerDiv.appendChild(titleSpan);
+    
+    // Add buttons container for multiple controls
+    const buttonsContainer = document.createElement('div');
+    buttonsContainer.style.display = 'flex';
+    buttonsContainer.style.gap = '5px';
+    
+    // Add tab buttons for current vs average stats
+    const tabsContainer = document.createElement('div');
+    tabsContainer.style.display = 'flex';
+    tabsContainer.style.border = '1px solid rgba(255,255,255,0.3)';
+    tabsContainer.style.borderRadius = '3px';
+    tabsContainer.style.marginRight = '5px';
+    
+    const currentTabBtn = document.createElement('button');
+    currentTabBtn.id = 'current-stats-tab';
+    currentTabBtn.textContent = 'Current';
+    currentTabBtn.style.background = 'rgba(255,255,255,0.2)';
+    currentTabBtn.style.border = 'none';
+    currentTabBtn.style.color = 'white';
+    currentTabBtn.style.padding = '3px 6px';
+    currentTabBtn.style.fontSize = '12px';
+    currentTabBtn.style.cursor = 'pointer';
+    
+    const avgTabBtn = document.createElement('button');
+    avgTabBtn.id = 'average-stats-tab';
+    avgTabBtn.textContent = 'Average';
+    avgTabBtn.style.background = 'transparent';
+    avgTabBtn.style.border = 'none';
+    avgTabBtn.style.color = 'white';
+    avgTabBtn.style.padding = '3px 6px';
+    avgTabBtn.style.fontSize = '12px';
+    avgTabBtn.style.cursor = 'pointer';
+    
+    tabsContainer.appendChild(currentTabBtn);
+    tabsContainer.appendChild(avgTabBtn);
+    buttonsContainer.appendChild(tabsContainer);
     
     // Add toggle button
     const toggleButton = document.createElement('button');
@@ -81,23 +125,52 @@ export class EnhancedPerformanceTracker extends PerformanceTracker {
     toggleButton.style.fontSize = '16px';
     toggleButton.style.padding = '0';
     
-    // Create content div that can be toggled
-    const contentDiv = document.createElement('div');
-    contentDiv.id = 'performance-stats-content';
+    buttonsContainer.appendChild(toggleButton);
+    headerDiv.appendChild(buttonsContainer);
+    
+    // Create content divs that can be toggled
+    const contentContainer = document.createElement('div');
+    contentContainer.id = 'performance-stats-content-container';
+    
+    const currentStatsDiv = document.createElement('div');
+    currentStatsDiv.id = 'current-stats-content';
+    
+    const avgStatsDiv = document.createElement('div');
+    avgStatsDiv.id = 'average-stats-content';
+    avgStatsDiv.style.display = 'none';
+    
+    contentContainer.appendChild(currentStatsDiv);
+    contentContainer.appendChild(avgStatsDiv);
+    
+    // Tab switching functionality
+    currentTabBtn.addEventListener('click', (e) => {
+      e.stopPropagation(); // Prevent drag
+      currentTabBtn.style.background = 'rgba(255,255,255,0.2)';
+      avgTabBtn.style.background = 'transparent';
+      currentStatsDiv.style.display = 'block';
+      avgStatsDiv.style.display = 'none';
+    });
+    
+    avgTabBtn.addEventListener('click', (e) => {
+      e.stopPropagation(); // Prevent drag
+      currentTabBtn.style.background = 'transparent';
+      avgTabBtn.style.background = 'rgba(255,255,255,0.2)';
+      currentStatsDiv.style.display = 'none';
+      avgStatsDiv.style.display = 'block';
+    });
     
     // Toggle functionality
     let isCollapsed = false;
     toggleButton.addEventListener('click', (e) => {
       e.stopPropagation(); // Prevent drag from starting
       isCollapsed = !isCollapsed;
-      contentDiv.style.display = isCollapsed ? 'none' : 'block';
+      contentContainer.style.display = isCollapsed ? 'none' : 'block';
       toggleButton.textContent = isCollapsed ? '+' : '-';
-      container.style.width = isCollapsed ? 'auto' : '300px';
+      container.style.width = isCollapsed ? 'auto' : '360px';
     });
     
-    headerDiv.appendChild(toggleButton);
     container.appendChild(headerDiv);
-    container.appendChild(contentDiv);
+    container.appendChild(contentContainer);
     
     document.body.appendChild(container);
   }
@@ -109,6 +182,10 @@ export class EnhancedPerformanceTracker extends PerformanceTracker {
     let isDragging = false;
     let offsetX = 0;
     let offsetY = 0;
+    
+    // Only make the header draggable
+    const header = document.getElementById('performance-stats-header');
+    if (!header) return;
     
     // Handle start of drag
     const handleMouseDown = (e: MouseEvent) => {
@@ -167,12 +244,12 @@ export class EnhancedPerformanceTracker extends PerformanceTracker {
     };
     
     // Add event listeners
-    element.addEventListener('mousedown', handleMouseDown);
+    header.addEventListener('mousedown', handleMouseDown);
     document.addEventListener('mousemove', handleMouseMove);
     document.addEventListener('mouseup', handleMouseUp);
     
     // Also handle touch events for mobile
-    element.addEventListener('touchstart', (e: TouchEvent) => {
+    header.addEventListener('touchstart', (e: TouchEvent) => {
       const touch = e.touches[0];
       handleMouseDown({ clientX: touch.clientX, clientY: touch.clientY } as MouseEvent);
     });
@@ -195,6 +272,11 @@ export class EnhancedPerformanceTracker extends PerformanceTracker {
     
     const currentTime = performance.now();
     this.frameCount++;
+    
+    // Update long-term averages with every frame
+    this.longTermFpsCount++;
+    this.longTermSimTimeSum += simulationTime;
+    this.longTermRenderTimeSum += renderTime;
     
     // Update stats every few seconds
     if (currentTime - this.lastUpdateTime >= this.updateInterval) {
@@ -222,8 +304,9 @@ export class EnhancedPerformanceTracker extends PerformanceTracker {
         this.particlesPerSecondHistory.shift();
       }
       
-      // Update the stats display
-      this.updateStatsDisplay(fps, avgSimulationTime, avgRenderTime, particlesPerSecond, numParticles);
+      // Update the stats displays
+      this.updateCurrentStatsDisplay(fps, avgSimulationTime, avgRenderTime, particlesPerSecond, numParticles);
+      this.updateAverageStatsDisplay(numParticles);
       
       // Reset counters
       this.frameCount = 0;
@@ -241,6 +324,12 @@ export class EnhancedPerformanceTracker extends PerformanceTracker {
     // Reset our tracking data
     this.frameCount = 0;
     this.lastUpdateTime = performance.now();
+    this.sessionStartTime = performance.now();
+    
+    // Reset long-term averages
+    this.longTermFpsCount = 0;
+    this.longTermSimTimeSum = 0;
+    this.longTermRenderTimeSum = 0;
     
     // Clear histories
     this.fpsHistory = [];
@@ -248,14 +337,25 @@ export class EnhancedPerformanceTracker extends PerformanceTracker {
     this.renderTimeHistory = [];
     this.particlesPerSecondHistory = [];
     
-    // Clear the display
-    const contentDiv = document.getElementById('performance-stats-content');
-    if (contentDiv) {
-      contentDiv.innerHTML = '<div style="text-align: center; padding: 20px;">Collecting data...</div>';
+    // Clear the displays
+    const currentStatsContent = document.getElementById('current-stats-content');
+    const averageStatsContent = document.getElementById('average-stats-content');
+    
+    const loadingMessage = '<div style="text-align: center; padding: 20px;">Collecting data...</div>';
+    
+    if (currentStatsContent) {
+      currentStatsContent.innerHTML = loadingMessage;
+    }
+    
+    if (averageStatsContent) {
+      averageStatsContent.innerHTML = loadingMessage;
     }
   }
   
-  private updateStatsDisplay(fps: number, simulationTime: number, renderTime: number, particlesPerSecond: number, numParticles: number): void {
+  /**
+   * Update the display for current performance statistics
+   */
+  private updateCurrentStatsDisplay(fps: number, simulationTime: number, renderTime: number, particlesPerSecond: number, numParticles: number): void {
     const totalTime = simulationTime + renderTime;
     
     // Calculate trend indicators
@@ -266,27 +366,81 @@ export class EnhancedPerformanceTracker extends PerformanceTracker {
     // Format for friendly display (millions of particles per second)
     const mParticlesPerSecond = (particlesPerSecond / 1_000_000).toFixed(2);
     
-    const contentDiv = document.getElementById('performance-stats-content');
+    const contentDiv = document.getElementById('current-stats-content');
     if (contentDiv) {
       contentDiv.innerHTML = `
+        <div style="font-size: 12px; margin-bottom: 5px; color: #aaa;">Current metrics (last ${(this.updateInterval/1000).toFixed(1)}s)</div>
         <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 5px;">
-          <div>FPS:</div>
+          <div title="Frames per second - higher is better">FPS:</div>
           <div style="text-align: right;">${fps.toFixed(1)} ${fpsIndicator}</div>
           
-          <div>Particles:</div>
+          <div title="Total number of particles in the simulation">Particles:</div>
           <div style="text-align: right;">${numParticles.toLocaleString()}</div>
           
-          <div>Sim Time:</div>
+          <div title="Time spent on physics calculations per frame - lower is better">Sim Time:</div>
           <div style="text-align: right;">${simulationTime.toFixed(2)}ms ${simTimeIndicator}</div>
           
-          <div>Render Time:</div>
+          <div title="Time spent on rendering per frame - lower is better">Render Time:</div>
           <div style="text-align: right;">${renderTime.toFixed(2)}ms ${renderTimeIndicator}</div>
           
-          <div>Total Time:</div>
+          <div title="Total processing time per frame - lower is better">Total Time:</div>
           <div style="text-align: right;">${totalTime.toFixed(2)}ms</div>
           
-          <div>M Particles/s:</div>
+          <div title="Millions of particles processed per second - higher is better">M Particles/s:</div>
           <div style="text-align: right;">${mParticlesPerSecond}</div>
+        </div>
+      `;
+    }
+  }
+  
+  /**
+   * Update the display for average performance statistics with corrected calculations
+   */
+  private updateAverageStatsDisplay(numParticles: number): void {
+    const currentTime = performance.now();
+    const sessionDuration = (currentTime - this.sessionStartTime) / 1000; // in seconds
+    
+    // Calculate FPS directly from total frames and elapsed time
+    const actualAvgFps = this.longTermFpsCount / Math.max(1, sessionDuration);
+    
+    // Calculate averages for simulation and render times
+    const avgSimTime = this.longTermSimTimeSum / Math.max(1, this.longTermFpsCount);
+    const avgRenderTime = this.longTermRenderTimeSum / Math.max(1, this.longTermFpsCount);
+    const avgTotalTime = avgSimTime + avgRenderTime;
+    
+    // Calculate particles per second based on actual FPS
+    const avgParticlesPerSecond = numParticles * actualAvgFps;
+    
+    // Format duration as minutes:seconds
+    const minutes = Math.floor(sessionDuration / 60);
+    const seconds = Math.floor(sessionDuration % 60);
+    const durationString = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    
+    const contentDiv = document.getElementById('average-stats-content');
+    if (contentDiv) {
+      contentDiv.innerHTML = `
+        <div style="font-size: 12px; margin-bottom: 5px; color: #aaa;">Average metrics over session (${durationString})</div>
+        <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 5px;">
+          <div title="Average frames per second during this session">Avg FPS:</div>
+          <div style="text-align: right;">${actualAvgFps.toFixed(1)}</div>
+          
+          <div title="Total number of particles in the simulation">Particles:</div>
+          <div style="text-align: right;">${numParticles.toLocaleString()}</div>
+          
+          <div title="Average simulation time per frame">Avg Sim Time:</div>
+          <div style="text-align: right;">${avgSimTime.toFixed(2)}ms</div>
+          
+          <div title="Average rendering time per frame">Avg Render Time:</div>
+          <div style="text-align: right;">${avgRenderTime.toFixed(2)}ms</div>
+          
+          <div title="Average total processing time per frame">Avg Total Time:</div>
+          <div style="text-align: right;">${avgTotalTime.toFixed(2)}ms</div>
+          
+          <div title="Average millions of particles processed per second">Avg M Particles/s:</div>
+          <div style="text-align: right;">${(avgParticlesPerSecond / 1_000_000).toFixed(2)}</div>
+          
+          <div title="Total frames processed during this session">Total Frames:</div>
+          <div style="text-align: right;">${this.longTermFpsCount.toLocaleString()}</div>
         </div>
       `;
     }
