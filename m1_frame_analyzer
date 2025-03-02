@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+import os
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+import cv2
+from typing import List, Dict, Tuple, Optional
+import argparse
+from datetime import datetime
+import hashlib
+import glob
+from scipy.spatial.distance import cosine
+from skimage.metrics import structural_similarity as ssim
+
+class FrameAnalyzer:
+    """
+    Tool for analyzing frame differences between original and M1-optimized WebGPU rendering
+    """
+    
+    def __init__(self, original_dir: str, optimized_dir: str, output_dir: str):
+        """
+        Initialize the analyzer with directories for original and optimized frames
+        
+        Args:
+            original_dir: Directory containing original frame captures
+            optimized_dir: Directory containing M1-optimized frame captures
+            output_dir: Directory to store analysis results
+        """
+        self.original_dir = original_dir
+        self.optimized_dir = optimized_dir
+        self.output_dir = output_dir
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Load frame metadata if it exists
+        self.original_frames = self._load_frames(original_dir)
+        self.optimized_frames = self._load_frames(optimized_dir)
+        
+        # Performance metrics
+        self.original_frame_times = []
+        self.optimized_frame_times = []
+        
+        # Visual comparison metrics
+        self.similarity_scores = []
+        self.difference_heatmaps = []
+        
+        print(f"Found {len(self.original_frames)} original frames and {len(self.optimized_frames)} optimized frames")
+    
+    def _load_frames(self, directory: str) -> List[Dict]:
+        """
+        Load frame data from a directory
+        
+        Args:
+            directory: Directory containing frame captures
+        
+        Returns:
+            List of frame data objects
+        """
+        frames = []
+        
+        # Look for image files
+        image_paths = sorted(glob.glob(os.path.join(directory, "frame_*.png")))
+        
+        # Check for metadata
+        metadata_path = os.path.join(directory, "frame_metadata.json")
+        metadata = {}
+        
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+            except Exception as e:
+                print(f"Warning: Could not load metadata from {metadata_path}: {e}")
+        
+        # Process each frame
+        for i, path in enumerate(image_paths):
+            frame_number = i
+            
+            # Extract frame number from filename if possible
+            filename = os.path.basename(path)
+            if filename.startswith("frame_") and filename.endswith(".png"):
+                try:
+                    frame_number = int(filename[6:-4])
+                except ValueError:
+                    pass
+            
+            # Get frame-specific metadata
+            frame_meta = metadata.get(str(frame_number), {})
+            
+            # Load image
+            try:
+                img = Image.open(path)
+                # Convert to numpy array for later processing
+                img_array = np.array(img)
+                
+                frames.append({
+                    "number": frame_number,
+                    "path": path,
+                    "width": img.width,
+                    "height": img.height,
+                    "array": img_array,
+                    "render_time_ms": frame_meta.get("render_time_ms", None),
+                    "timestamp": frame_meta.get("timestamp", None)
+                })
+            except Exception as e:
+                print(f"Warning: Could not load frame from {path}: {e}")
+        
+        return sorted(frames, key=lambda f: f["number"])
+    
+    def analyze_performance(self):
+        """Analyze performance metrics between original and optimized frames"""
+        # Extract render times
+        self.original_frame_times = [f.get("render_time_ms", 0) for f in self.original_frames if f.get("render_time_ms") is not None]
+        self.optimized_frame_times = [f.get("render_time_ms", 0) for f in self.optimized_frames if f.get("render_time_ms") is not None]
+        
+        # If no render times available, calculate approximate times from timestamps
+        if not self.original_frame_times and all(f.get("timestamp") for f in self.original_frames):
+            timestamps = [f.get("timestamp") for f in self.original_frames]
+            # Convert timestamps to milliseconds and calculate diffs
+            timestamps = [datetime.fromisoformat(ts).timestamp() * 1000 if isinstance(ts, str) else ts for ts in timestamps]
+            self.original_frame_times = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
+        
+        if not self.optimized_frame_times and all(f.get("timestamp") for f in self.optimized_frames):
+            timestamps = [f.get("timestamp") for f in self.optimized_frames]
+            # Convert timestamps to milliseconds and calculate diffs
+            timestamps = [datetime.fromisoformat(ts).timestamp() * 1000 if isinstance(ts, str) else ts for ts in timestamps]
+            self.optimized_frame_times = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
+        
+        # Generate performance summary
+        if self.original_frame_times and self.optimized_frame_times:
+            avg_original = np.mean(self.original_frame_times)
+            avg_optimized = np.mean(self.optimized_frame_times)
+            
+            improvement = (avg_original - avg_optimized) / avg_original * 100
+            
+            print(f"Performance Analysis:")
+            print(f"  Original avg frame time: {avg_original:.2f} ms ({1000/avg_original:.1f} FPS)")
+            print(f"  Optimized avg frame time: {avg_optimized:.2f} ms ({1000/avg_optimized:.1f} FPS)")
+            print(f"  Improvement: {improvement:.1f}%")
+            
+            # Save performance data
+            performance_data = {
+                "original": {
+                    "frame_times_ms": self.original_frame_times,
+                    "avg_frame_time_ms": avg_original,
+                    "fps": 1000 / avg_original
+                },
+                "optimized": {
+                    "frame_times_ms": self.optimized_frame_times,
+                    "avg_frame_time_ms": avg_optimized,
+                    "fps": 1000 / avg_optimized
+                },
+                "improvement_percentage": improvement
+            }
+            
+            with open(os.path.join(self.output_dir, "performance_analysis.json"), 'w') as f:
+                json.dump(performance_data, f, indent=2)
+        else:
+            print("Warning: No frame time data available")
+    
+    def analyze_visual_differences(self):
+        """Analyze visual differences between corresponding frames"""
+        # Match frames between original and optimized sets
+        matched_frames = self._match_frames()
+        
+        # Process each pair
+        for i, (orig_idx, opt_idx) in enumerate(matched_frames):
+            orig_frame = self.original_frames[orig_idx]
+            opt_frame = self.optimized_frames[opt_idx]
+            
+            # Compare images
+            similarity, diff_map = self._compare_images(orig_frame["array"], opt_frame["array"])
+            
+            self.similarity_scores.append(similarity)
+            self.difference_heatmaps.append(diff_map)
+            
+            # Save difference visualization
+            if i < 10:  # Save only the first 10 to avoid too many files
+                plt.figure(figsize=(15, 5))
+                
+                plt.subplot(1, 3, 1)
+                plt.imshow(orig_frame["array"])
+                plt.title(f"Original Frame {orig_frame['number']}")
+                plt.axis('off')
+                
+                plt.subplot(1, 3, 2)
+                plt.imshow(opt_frame["array"])
+                plt.title(f"Optimized Frame {opt_frame['number']}")
+                plt.axis('off')
+                
+                plt.subplot(1, 3, 3)
+                plt.imshow(diff_map, cmap='hot')
+                plt.title(f"Difference (SSIM: {similarity:.3f})")
+                plt.colorbar()
+                plt.axis('off')
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(self.output_dir, f"comparison_{i:03d}.png"))
+                plt.close()
+        
+        # Calculate overall stats
+        if self.similarity_scores:
+            avg_similarity = np.mean(self.similarity_scores)
+            print(f"Visual Comparison:")
+            print(f"  Average frame similarity (SSIM): {avg_similarity:.4f} (1.0 is identical)")
+            print(f"  Visual differences: {(1 - avg_similarity) * 100:.1f}%")
+            
+            # Save visual comparison data
+            visual_data = {
+                "similarity_scores": self.similarity_scores,
+                "average_similarity": avg_similarity
+            }
+            
+            with open(os.path.join(self.output_dir, "visual_analysis.json"), 'w') as f:
+                json.dump(visual_data, f, indent=2)
+    
+    def _match_frames(self) -> List[Tuple[int, int]]:
+        """
+        Match frames between original and optimized sets using fuzzy matching
+        
+        Returns:
+            List of tuples (original_index, optimized_index) for matched frames
+        """
+        matches = []
+        
+        # If we have equal number of frames, assume direct correspondence
+        if len(self.original_frames) == len(self.optimized_frames):
+            matches = [(i, i) for i in range(len(self.original_frames))]
+        else:
+            # For unequal frame counts, use image similarity to match
+            for i, orig_frame in enumerate(self.original_frames):
+                best_match = -1
+                best_score = -1
+                
+                # Convert to grayscale and resize for faster comparison
+                orig_gray = cv2.cvtColor(orig_frame["array"], cv2.COLOR_RGB2GRAY)
+                orig_gray = cv2.resize(orig_gray, (64, 64))
+                orig_hist = cv2.calcHist([orig_gray], [0], None, [64], [0, 256])
+                orig_hist = cv2.normalize(orig_hist, orig_hist).flatten()
+                
+                for j, opt_frame in enumerate(self.optimized_frames):
+                    # Skip if already matched with better score
+                    if j in [m[1] for m in matches]:
+                        continue
+                    
+                    # Compare histograms for quick matching
+                    opt_gray = cv2.cvtColor(opt_frame["array"], cv2.COLOR_RGB2GRAY)
+                    opt_gray = cv2.resize(opt_gray, (64, 64))
+                    opt_hist = cv2.calcHist([opt_gray], [0], None, [64], [0, 256])
+                    opt_hist = cv2.normalize(opt_hist, opt_hist).flatten()
+                    
+                    # Calculate similarity score (1 - cosine distance)
+                    score = 1 - cosine(orig_hist, opt_hist)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_match = j
+                
+                if best_match >= 0 and best_score > 0.7:  # Threshold for considering a match
+                    matches.append((i, best_match))
+        
+        return matches
+    
+    def _compare_images(self, img1: np.ndarray, img2: np.ndarray) -> Tuple[float, np.ndarray]:
+        """
+        Compare two images and return similarity score and difference heatmap
+        
+        Args:
+            img1: First image array
+            img2: Second image array
+            
+        Returns:
+            Tuple of (similarity_score, difference_heatmap)
+        """
+        # Ensure images are the same size
+        if img1.shape != img2.shape:
+            # Resize the second image to match the first
+            img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+        
+        # Convert to grayscale for structural similarity
+        if len(img1.shape) == 3:
+            gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
+        else:
+            gray1 = img1
+            
+        if len(img2.shape) == 3:
+            gray2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY)
+        else:
+            gray2 = img2
+        
+        # Calculate SSIM
+        score, diff = ssim(gray1, gray2, full=True)
+        
+        # Normalize difference for visualization
+        diff = (diff - np.min(diff)) / (np.max(diff) - np.min(diff) + 1e-8)
+        
+        return score, diff
+    
+    def generate_summary_visualizations(self):
+        """Generate summary visualizations for performance and visual analysis"""
+        # Performance visualization
+        if self.original_frame_times and self.optimized_frame_times:
+            plt.figure(figsize=(15, 10))
+            
+            # Frame times plot
+            plt.subplot(2, 2, 1)
+            plt.plot(self.original_frame_times, label='Original')
+            plt.plot(self.optimized_frame_times, label='M1 Optimized')
+            plt.title('Frame Render Times')
+            plt.xlabel('Frame Number')
+            plt.ylabel('Time (ms)')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            # Average frame time comparison
+            plt.subplot(2, 2, 2)
+            avg_orig = np.mean(self.original_frame_times)
+            avg_opt = np.mean(self.optimized_frame_times)
+            plt.bar(['Original', 'M1 Optimized'], [avg_orig, avg_opt], color=['#FF9999', '#99CCFF'])
+            plt.title('Average Frame Time')
+            plt.ylabel('Time (ms)')
+            for i, v in enumerate([avg_orig, avg_opt]):
+                plt.text(i, v + 0.1, f"{v:.2f} ms", ha='center')
+            plt.grid(True, alpha=0.3, axis='y')
+            
+            # FPS comparison
+            plt.subplot(2, 2, 3)
+            fps_orig = 1000 / avg_orig
+            fps_opt = 1000 / avg_opt
+            plt.bar(['Original', 'M1 Optimized'], [fps_orig, fps_opt], color=['#FF9999', '#99CCFF'])
+            plt.title('Frames Per Second (FPS)')
+            plt.ylabel('FPS')
+            for i, v in enumerate([fps_orig, fps_opt]):
+                plt.text(i, v + 0.1, f"{v:.1f} FPS", ha='center')
+            plt.grid(True, alpha=0.3, axis='y')
+            
+            # Frame time distribution
+            plt.subplot(2, 2, 4)
+            plt.hist(self.original_frame_times, alpha=0.5, bins=20, label='Original', color='#FF9999')
+            plt.hist(self.optimized_frame_times, alpha=0.5, bins=20, label='M1 Optimized', color='#99CCFF')
+            plt.title('Frame Time Distribution')
+            plt.xlabel('Time (ms)')
+            plt.ylabel('Count')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, "performance_summary.png"))
+            plt.close()
+        
+        # Visual similarity visualization
+        if self.similarity_scores:
+            plt.figure(figsize=(12, 6))
+            
+            plt.subplot(1, 2, 1)
+            plt.plot(self.similarity_scores)
+            plt.title('Frame-by-Frame Similarity (SSIM)')
+            plt.xlabel('Frame Pair')
+            plt.ylabel('SSIM Score (1.0 = identical)')
+            plt.grid(True, alpha=0.3)
+            
+            plt.subplot(1, 2, 2)
+            similarities = np.array(self.similarity_scores)
+            plt.hist(similarities, bins=20, color='#99CCFF')
+            plt.title('Distribution of Similarity Scores')
+            plt.xlabel('SSIM Score')
+            plt.ylabel('Count')
+            plt.axvline(x=np.mean(similarities), color='r', linestyle='--', label=f'Mean: {np.mean(similarities):.3f}')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, "visual_summary.png"))
+            plt.close()
+    
+    def generate_html_report(self):
+        """Generate an HTML report with all analysis results"""
+        # Read performance data
+        perf_data = {}
+        try:
+            with open(os.path.join(self.output_dir, "performance_analysis.json"), 'r') as f:
+                perf_data = json.load(f)
+        except:
+            pass
+        
+        # Read visual data
+        visual_data = {}
+        try:
+            with open(os.path.join(self.output_dir, "visual_analysis.json"), 'r') as f:
+                visual_data = json.load(f)
+        except:
+            pass
+        
+        # Get image paths for comparison visualizations
+        comparison_images = sorted(glob.glob(os.path.join(self.output_dir, "comparison_*.png")))
+        comparison_images = [os.path.basename(p) for p in comparison_images]
+        
+        # Build HTML
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>M1 Optimization Analysis Report</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; max-width: 1200px; margin: 0 auto; }}
+                h1, h2, h3 {{ color: #333; }}
+                .container {{ margin-bottom: 30px; }}
+                .metrics {{ display: flex; flex-wrap: wrap; gap: 20px; }}
+                .metric-card {{ background: #f5f5f5; border-radius: 5px; padding: 15px; flex: 1; min-width: 200px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
+                .metric-value {{ font-size: 24px; font-weight: bold; margin: 10px 0; }}
+                .improvement {{ color: green; }}
+                .images-container {{ display: flex; flex-wrap: wrap; gap: 20px; margin-top: 20px; }}
+                .image-card {{ background: white; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 10px; flex: 1; min-width: 300px; }}
+                img {{ max-width: 100%; border-radius: 3px; }}
+                table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                th {{ background-color: #f2f2f2; }}
+                tr:nth-child(even) {{ background-color: #f9f9f9; }}
+            </style>
+        </head>
+        <body>
+            <h1>WebGPU M1 Optimization Analysis Report</h1>
+            <p>Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            
+            <div class="container">
+                <h2>Performance Summary</h2>
+                <div class="metrics">
+        """
+        
+        # Add performance metrics
+        if perf_data:
+            orig_time = perf_data.get("original", {}).get("avg_frame_time_ms", 0)
+            opt_time = perf_data.get("optimized", {}).get("avg_frame_time_ms", 0)
+            orig_fps = perf_data.get("original", {}).get("fps", 0)
+            opt_fps = perf_data.get("optimized", {}).get("fps", 0)
+            improvement = perf_data.get("improvement_percentage", 0)
+            
+            html += f"""
+                    <div class="metric-card">
+                        <h3>Original Frame Time</h3>
+                        <div class="metric-value">{orig_time:.2f} ms</div>
+                        <p>Estimated FPS: {orig_fps:.1f}</p>
+                    </div>
+                    
+                    <div class="metric-card">
+                        <h3>M1 Optimized Frame Time</h3>
+                        <div class="metric-value">{opt_time:.2f} ms</div>
+                        <p>Estimated FPS: {opt_fps:.1f}</p>
+                    </div>
+                    
+                    <div class="metric-card">
+                        <h3>Performance Improvement</h3>
+                        <div class="metric-value improvement">+{improvement:.1f}%</div>
+                        <p>FPS Increase: {opt_fps - orig_fps:.1f}</p>
+                    </div>
+            """
+        
+        html += """
+                </div>
+                
+                <div class="images-container">
+                    <div class="image-card">
+                        <h3>Performance Metrics</h3>
+                        <img src="performance_summary.png" alt="Performance Summary">
+                    </div>
+                </div>
+            </div>
+            
+            <div class="container">
+                <h2>Visual Analysis</h2>
+        """
+        
+        # Add visual analysis
+        if visual_data:
+            avg_similarity = visual_data.get("average_similarity", 0)
+            
+            html += f"""
+                <div class="metrics">
+                    <div class="metric-card">
+                        <h3>Average Frame Similarity</h3>
+                        <div class="metric-value">{avg_similarity:.4f}</div>
+                        <p>1.0 = identical, higher is better</p>
+                    </div>
+                    
+                    <div class="metric-card">
+                        <h3>Visual Difference</h3>
+                        <div class="metric-value">{(1-avg_similarity)*100:.1f}%</div>
+                        <p>Lower is better - indicates less visual change</p>
+                    </div>
+                </div>
+                
+                <div class="images-container">
+                    <div class="image-card">
+                        <h3>Visual Similarity Analysis</h3>
+                        <img src="visual_summary.png" alt="Visual Similarity Summary">
+                    </div>
+                </div>
+            """
+        
+        # Add frame comparisons
+        if comparison_images:
+            html += """
+                <h3>Frame Comparisons</h3>
+                <p>Sample comparisons between original and optimized frames</p>
+            """
+            
+            for i, img_path in enumerate(comparison_images):
+                html += f"""
+                <div class="images-container">
+                    <div class="image-card">
+                        <h4>Comparison {i+1}</h4>
+                        <img src="{img_path}" alt="Frame Comparison {i+1}">
+                    </div>
+                </div>
+                """
+        
+        html += """
+            </div>
+            
+            <div class="container">
+                <h2>Conclusion</h2>
+                <p>
+                    This analysis compares the performance and visual characteristics of the original WebGPU implementation 
+                    versus the version optimized for Apple M1 GPUs. The M1 optimizations focus on taking advantage of 
+                    the tile-based deferred rendering architecture, unified memory, and appropriate workgroup sizes.
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        # Write HTML report
+        with open(os.path.join(self.output_dir, "report.html"), 'w') as f:
+            f.write(html)
+        
+        print(f"HTML report generated at {os.path.join(self.output_dir, 'report.html')}")
+    
+    def run_analysis(self):
+        """Run the complete analysis pipeline"""
+        print("Starting frame analysis...")
+        
+        self.analyze_performance()
+        self.analyze_visual_differences()
+        self.generate_summary_visualizations()
+        self.generate_html_report()
+        
+        print("Analysis complete!")
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze frame differences between original and M1-optimized WebGPU rendering")
+    parser.add_argument("--original", "-o", required=True, help="Directory containing original frame captures")
+    parser.add_argument("--optimized", "-m", required=True, help="Directory containing M1-optimized frame captures")
+    parser.add_argument("--output", "-out", default="analysis_results", help="Directory to store analysis results")
+    
+    args = parser.parse_args()
+    
+    analyzer = FrameAnalyzer(args.original, args.optimized, args.output)
+    analyzer.run_analysis()
+
+if __name__ == "__main__":
+    main()
