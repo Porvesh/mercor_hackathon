@@ -18,81 +18,119 @@ struct FragmentInput {
     @location(1) iuv: vec2f, 
 }
 
-fn computeViewPosFromUVDepth(tex_coord: vec2f, depth: f32) -> vec3f {
-    var ndc: vec4f = vec4f(tex_coord.x * 2.0 - 1.0, 1.0 - 2.0 * tex_coord.y, 0.0, 1.0);
-    // なんかこれで合う
-    ndc.z = -uniforms.projection_matrix[2].z + uniforms.projection_matrix[3].z / depth;
-    ndc.w = 1.0;
-
-    var eye_pos: vec4f = uniforms.inv_projection_matrix * ndc;
-
-    return eye_pos.xyz / eye_pos.w;
+// Cache uniforms that are used multiple times to reduce binding access
+fn computeViewPosFromUVDepth(tex_coord: vec2f, depth: f32, inv_proj: mat4x4f, proj_z: f32, proj_w: f32) -> vec3f {
+    // Compute NDC coordinates
+    let ndc = vec4f(
+        tex_coord.x * 2.0 - 1.0,
+        1.0 - 2.0 * tex_coord.y,
+        -proj_z + proj_w / depth,
+        1.0
+    );
+    
+    // Transform to view space
+    let eye_pos = inv_proj * ndc;
+    let inv_w = 1.0 / eye_pos.w; // Multiply is faster than divide on M1
+    
+    return eye_pos.xyz * inv_w;
 }
 
-fn getViewPosFromTexCoord(tex_coord: vec2f, iuv: vec2f) -> vec3f {
-    var depth: f32 = abs(textureLoad(texture, vec2u(iuv), 0).x);
-    return computeViewPosFromUVDepth(tex_coord, depth);
-}
-
+// Pack texture reads to minimize latency
 @fragment
 fn fs(input: FragmentInput) -> @location(0) vec4f {
-    var depth: f32 = abs(textureLoad(texture, vec2u(input.iuv), 0).r);
-
-    let bgColor: vec3f = vec3f(0.8, 0.8, 0.8);
-
-    if (depth >= 1e4 || depth <= 0.) {
-        return vec4f(bgColor, 1.);
-    }
-
-    var viewPos: vec3f = computeViewPosFromUVDepth(input.uv, depth); // z は負
-
-    var ddx: vec3f = getViewPosFromTexCoord(input.uv + vec2f(uniforms.texel_size.x, 0.), input.iuv + vec2f(1.0, 0.0)) - viewPos; 
-    var ddy: vec3f = getViewPosFromTexCoord(input.uv + vec2f(0., uniforms.texel_size.y), input.iuv + vec2f(0.0, 1.0)) - viewPos; 
-    var ddx2: vec3f = viewPos - getViewPosFromTexCoord(input.uv + vec2f(-uniforms.texel_size.x, 0.), input.iuv + vec2f(-1.0, 0.0));
-    var ddy2: vec3f = viewPos - getViewPosFromTexCoord(input.uv + vec2f(0., -uniforms.texel_size.y), input.iuv + vec2f(0.0, -1.0));
-
-    if (abs(ddx.z) > abs(ddx2.z)) {
-        ddx = ddx2; 
-    }
-    if (abs(ddy.z) > abs(ddy2.z)) {
-        ddy = ddy2;
-    }
-
-    var normal: vec3f = -normalize(cross(ddx, ddy)); 
-    var rayDir = normalize(viewPos);
-    var lightDir = normalize((uniforms.view_matrix * vec4f(0, 0, -1, 0.)).xyz);
-    var H: vec3f        = normalize(lightDir - rayDir);
-    var specular: f32   = pow(max(0.0, dot(H, normal)), 250.);
-    var diffuse: f32  = max(0.0, dot(lightDir, normal)) * 1.0;
-
-    var density = 1.5; 
+    // Cache uniform values to reduce binding access
+    let inv_proj = uniforms.inv_projection_matrix;
+    let proj_z = uniforms.projection_matrix[2].z;
+    let proj_w = uniforms.projection_matrix[3].z;
+    let texel_size = uniforms.texel_size;
+    let inv_view = uniforms.inv_view_matrix;
+    let view = uniforms.view_matrix;
     
-    var thickness = textureLoad(thickness_texture, vec2u(input.iuv), 0).r;
-    var diffuseColor = vec3f(0.085, 0.6375, 0.9);
-    var transmittance: vec3f = exp(-density * thickness * (1.0 - diffuseColor)); 
-    var refractionColor: vec3f = bgColor * transmittance;
-
-    let F0 = 0.02;
-    var fresnel: f32 = clamp(F0 + (1.0 - F0) * pow(1.0 - dot(normal, -rayDir), 5.0), 0., 1.0);
-
-    var reflectionDir: vec3f = reflect(rayDir, normal);
-    var reflectionDirWorld: vec3f = (uniforms.inv_view_matrix * vec4f(reflectionDir, 0.0)).xyz;
-    var reflectionColor: vec3f = textureSampleLevel(envmap_texture, texture_sampler, reflectionDirWorld, 0.).rgb; 
-    var finalColor = 1.0 * specular + mix(refractionColor, reflectionColor, fresnel);
-
+    // Precompute texture coordinates for all reads to batch memory operations
+    let iuv = vec2u(input.iuv);
+    let iuv_right = vec2u(input.iuv + vec2f(1.0, 0.0));
+    let iuv_left = vec2u(input.iuv + vec2f(-1.0, 0.0));
+    let iuv_up = vec2u(input.iuv + vec2f(0.0, 1.0));
+    let iuv_down = vec2u(input.iuv + vec2f(0.0, -1.0));
+    
+    let uv_right = input.uv + vec2f(texel_size.x, 0.0);
+    let uv_left = input.uv + vec2f(-texel_size.x, 0.0);
+    let uv_up = input.uv + vec2f(0.0, texel_size.y);
+    let uv_down = input.uv + vec2f(0.0, -texel_size.y);
+    
+    // Group texture reads to leverage cache locality
+    let depth_center = abs(textureLoad(texture, iuv, 0).r);
+    
+    // Early-out for background - benefits TBDR architecture
+    if (depth_center >= 1e4 || depth_center <= 0.0) {
+        return vec4f(0.8, 0.8, 0.8, 1.0);
+    }
+    
+    // Batch compute all depth samples needed
+    let depth_right = abs(textureLoad(texture, iuv_right, 0).r);
+    let depth_left = abs(textureLoad(texture, iuv_left, 0).r);
+    let depth_up = abs(textureLoad(texture, iuv_up, 0).r);
+    let depth_down = abs(textureLoad(texture, iuv_down, 0).r);
+    
+    // Pre-fetch thickness in same batch as depths
+    let thickness = textureLoad(thickness_texture, iuv, 0).r;
+    
+    // Compute view positions with cached uniform values
+    let viewPos = computeViewPosFromUVDepth(input.uv, depth_center, inv_proj, proj_z, proj_w);
+    let viewPos_right = computeViewPosFromUVDepth(uv_right, depth_right, inv_proj, proj_z, proj_w);
+    let viewPos_left = computeViewPosFromUVDepth(uv_left, depth_left, inv_proj, proj_z, proj_w);
+    let viewPos_up = computeViewPosFromUVDepth(uv_up, depth_up, inv_proj, proj_z, proj_w);
+    let viewPos_down = computeViewPosFromUVDepth(uv_down, depth_down, inv_proj, proj_z, proj_w);
+    
+    // Calculate derivatives
+    var ddx = viewPos_right - viewPos;
+    var ddy = viewPos_up - viewPos;
+    let ddx2 = viewPos - viewPos_left;
+    let ddy2 = viewPos - viewPos_down;
+    
+    // Use branchless select where it makes sense
+    ddx = select(ddx, ddx2, abs(ddx.z) > abs(ddx2.z));
+    ddy = select(ddy, ddy2, abs(ddy.z) > abs(ddy2.z));
+    
+    // Normal calculation - cross product very efficient on M1
+    let normal = -normalize(cross(ddx, ddy));
+    
+    // High ALU to memory ratio calculations for M1 efficiency
+    let rayDir = normalize(viewPos);
+    let lightDir = normalize((view * vec4f(0.0, 0.0, -1.0, 0.0)).xyz);
+    let H = normalize(lightDir - rayDir);
+    
+    // Optimize dot products - very efficient on M1
+    let n_dot_h = max(0.0, dot(H, normal));
+    let n_dot_l = max(0.0, dot(lightDir, normal));
+    let n_dot_v = dot(normal, -rayDir);
+    
+    // Fast math for specular - use built-in pow for performance
+    let specular = pow(n_dot_h, 250.0);
+    
+    // Combine ALU operations for better instruction packing
+    let diffuseColor = vec3f(0.085, 0.6375, 0.9);
+    let bgColor = vec3f(0.8);
+    
+    // Optimize exponential calculation - high ALU intensity
+    let density_thickness = 1.5 * thickness;
+    let one_minus_diffuse = 1.0 - diffuseColor;
+    let transmittance = exp(-density_thickness * one_minus_diffuse);
+    let refractionColor = bgColor * transmittance;
+    
+    // Fast Fresnel approximation - efficient on M1
+    let fresnel_factor = pow(1.0 - n_dot_v, 5.0);
+    let fresnel = clamp(0.02 + (0.98 * fresnel_factor), 0.0, 1.0);
+    
+    // Reflection calculation - minimize matrix multiplication overhead
+    let reflectionDir = reflect(rayDir, normal);
+    let reflectionDirWorld = (inv_view * vec4f(reflectionDir, 0.0)).xyz;
+    
+    // Single texture sample - minimize texture access
+    let reflectionColor = textureSampleLevel(envmap_texture, texture_sampler, reflectionDirWorld, 0.0).rgb;
+    
+    // Final color blend - high ALU efficiency
+    let finalColor = specular + mix(refractionColor, reflectionColor, fresnel);
+    
     return vec4f(finalColor, 1.0);
-
-    // return vec4f(viewPos.y * 100, 0, 0, 1.0);
-
-    // 法線
-    // return vec4f(0.5 * normal + 0.5, 1.);
-    // 法線の y 成分    
-    // return vec4f(vec3f(normal.x, 0, 0), 1);
-    // return vec4f(vec3f(normal.y, 0, 0), 1);
-    // return vec4f(vec3f(normal.z, 0, 0), 1);
-    // specular だけ
-    // return vec4f(vec3f(specular), 1);
-    // reflection だけ
-    // return vec4f(reflectionColor, 1.);
-    // return vec4f(fresnel, 0., 0., 1.);
 }
